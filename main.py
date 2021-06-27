@@ -33,3 +33,35 @@ english.build_vocab(train_data,max_size=100000,min_freq = 2)
 print(f"Unique tokens in source(de) vocabulary:{len(german.vocab)}")
 print(f"Unique tokens in souecs(en) vocabulary:{len(english.vocab)}")
 
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+BATCH_SIZE = 32
+
+train_iterator, valid_iterator, test_iterator = BucketIterator.splits((train_data,valid_data,test_data),
+                                                                      batch_size=BATCH_SIZE,
+                                                                      sort_within_batch=True,
+                                                                      sort_key=lambda x: len(x.src),
+                                                                      device = device)
+
+#Building an Encoder
+
+class Encoder(nn.Module):
+    def __init__(self,input_dim, emb_dim, hid_dim, n_layers, dropout):
+        super().__init__()
+#YAHA SIRF INITIALISATION KIYA HAIN
+        self.hid_dim = hid_dim
+        self.n_layers = n_layers
+
+        #"embedding" is an object created for the Layer "Embedding"
+        #so to perform embedding process we use its object
+        self.embedding = nn.Embedding(input_dim, emb_dim)
+        self.rnn = nn.LSTM(emb_dim,hid_dim,n_layers,dropout=dropout)
+        self.dropout = nn.Dropout(dropout)
+#YAHA PE ACTUALLY LSTM AUR EMBEDDING LAYER AUR DROPOUT LAYERS NE KAAM KIYA HAIN
+    def forward(self, src):
+        #PASSSED THE GERMAN LANGUAGE INTO EMBEDDING LAYER AND ADD DROPOUTS
+        embedded = self.dropout(self.embedding(src))
+        #OUTPUT OF THIS EMBEDDING LAYER IS PASSED ON TO THE LSTM LAYER
+        outputs, (hidden, cell) = self.rnn(embedded)
+
+        return hidden,cell
+
