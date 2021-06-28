@@ -1,73 +1,108 @@
 """https://towardsdatascience.com/a-comprehensive-guide-to-neural-machine-translation-using-seq2sequence-modelling-using-pytorch-41c9b84ba350"""
 """ https://github.com/bentrevett/pytorch-seq2seq/blob/master/1%20-%20Sequence%20to%20Sequence%20Learning%20with%20Neural%20Networks.ipynb """
 
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
+
 from torchtext.legacy.datasets import Multi30k
 from torchtext.legacy.data import Field, BucketIterator
+
+import spacy
 import numpy as np
-import pandas as pd
-import spacy,random
+
+import random
+import math
+import time
 
 ##Data Preparation and Pre-processing
 
-spacy_german = spacy.load("de_core_news_sm")
-spacy_english = spacy.load("en_core_web_sm")
+spacy_de = spacy.load('de_core_news_sm')
+spacy_en = spacy.load('en_core_web_sm')
 
-def tokenize_german(text):
-    return [token.text for token in spacy_german.tokenizer(text)]
+def tokenize_de(text):
+    """
+    Tokenizes German text from a string into a list of strings (tokens) and reverses it
+    """
+    return [tok.text for tok in spacy_de.tokenizer(text)][::-1]
 
-def tokenize_english(text):
-    return [token.text for token in spacy_english.tokenizer(text)]
+def tokenize_en(text):
+    """
+    Tokenizes English text from a string into a list of strings (tokens)
+    """
+    return [tok.text for tok in spacy_en.tokenizer(text)]
 
-german = Field(tokenize = tokenize_german,lower=True, init_token = "<sos>", eos_token = "<eos>")
+SRC = Field(tokenize = tokenize_de,
+            init_token = '<sos>',
+            eos_token = '<eos>',
+            lower = True)
 
-english = Field(tokenize = tokenize_english,lower=True, init_token="<sos>", eos_token = "<eos>")
+TRG = Field(tokenize = tokenize_en,
+            init_token = '<sos>',
+            eos_token = '<eos>',
+            lower = True)
 
-train_data, valid_data, test_data = Multi30k.splits(exts = (".de", ".en"),
-                                                    fields=(german, english))
+train_data, valid_data, test_data = Multi30k.splits(exts = ('.de', '.en'),
+                                                    fields = (SRC, TRG))
 
-german.build_vocab(train_data,max_size=100000,min_freq = 2)
-english.build_vocab(train_data,max_size=100000,min_freq = 2)
+print(f"Number of training examples: {len(train_data.examples)}")
+print(f"Number of validation examples: {len(valid_data.examples)}")
+print(f"Number of testing examples: {len(test_data.examples)}")
 
-print(f"Unique tokens in source(de) vocabulary:{len(german.vocab)}")
-print(f"Unique tokens in souecs(en) vocabulary:{len(english.vocab)}")
+print(vars(train_data.examples[0]))
 
+SRC.build_vocab(train_data, min_freq = 2)
+TRG.build_vocab(train_data, min_freq = 2)
+
+print(f"Unique tokens in source (de) vocabulary: {len(SRC.vocab)}")
+print(f"Unique tokens in target (en) vocabulary: {len(TRG.vocab)}")
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-BATCH_SIZE = 32
 
-train_iterator, valid_iterator, test_iterator = BucketIterator.splits((train_data,valid_data,test_data),
-                                                                      batch_size=BATCH_SIZE,
-                                                                      sort_within_batch=True,
-                                                                      sort_key=lambda x: len(x.src),
-                                                                      device = device)
+BATCH_SIZE = 128
+
+train_iterator, valid_iterator, test_iterator = BucketIterator.splits(
+    (train_data, valid_data, test_data),
+    batch_size = BATCH_SIZE,
+    device = device)
 
 #Building an Encoder
-
 class Encoder(nn.Module):
-    def __init__(self,input_dim, emb_dim, hid_dim, n_layers, dropout):
+    def __init__(self, input_dim, emb_dim, hid_dim, n_layers, dropout):
         super().__init__()
-#YAHA SIRF INITIALISATION KIYA HAIN
+        # YAHA SIRF INITIALISATION KIYA HAIN
         self.hid_dim = hid_dim
         self.n_layers = n_layers
 
-        #"embedding" is an object created for the Layer "Embedding"
-        #so to perform embedding process we use its object
+        # "embedding" is an object created for the Layer "Embedding"
+        # so to perform embedding process we use its object
         self.embedding = nn.Embedding(input_dim, emb_dim)
-        self.rnn = nn.LSTM(emb_dim,hid_dim,n_layers,dropout=dropout)
+
+        self.rnn = nn.LSTM(emb_dim, hid_dim, n_layers, dropout=dropout)
+
         self.dropout = nn.Dropout(dropout)
-#YAHA PE ACTUALLY LSTM AUR EMBEDDING LAYER AUR DROPOUT LAYERS NE KAAM KIYA HAIN
+
+    # YAHA PE ACTUALLY LSTM AUR EMBEDDING LAYER AUR DROPOUT LAYERS NE KAAM KIYA HAIN
     def forward(self, src):
-        #PASSSED THE GERMAN LANGUAGE INTO EMBEDDING LAYER AND ADD DROPOUTS
+        # src = [src len, batch size]
+        # PASSSED THE GERMAN LANGUAGE INTO EMBEDDING LAYER AND ADD DROPOUTS
         embedded = self.dropout(self.embedding(src))
-        #OUTPUT OF THIS EMBEDDING LAYER IS PASSED ON TO THE LSTM LAYER
+
+        # embedded = [src len, batch size, emb dim]
+        # OUTPUT OF THIS EMBEDDING LAYER IS PASSED ON TO THE LSTM LAYER
         outputs, (hidden, cell) = self.rnn(embedded)
 
-        return hidden,cell
+        # outputs = [src len, batch size, hid dim * n directions]
+        # hidden = [n layers * n directions, batch size, hid dim]
+        # cell = [n layers * n directions, batch size, hid dim]
+
+        # outputs are always from the top hidden layer
+
+        return hidden, cell
+
 
 class Decoder(nn.Module):
-    def __init__(self,output_dim,emb_dim,hid_dim,n_layers,dropout):
+    def __init__(self, output_dim, emb_dim, hid_dim, n_layers, dropout):
         super().__init__()
 
         self.output_dim = output_dim
@@ -75,10 +110,14 @@ class Decoder(nn.Module):
         self.n_layers = n_layers
 
         self.embedding = nn.Embedding(output_dim, emb_dim)
-        self.rnn = nn.LSTM(emb_dim,hid_dim,n_layers,dropout=dropout)
 
-    def forward(self,input,hidden,cell):
+        self.rnn = nn.LSTM(emb_dim, hid_dim, n_layers, dropout=dropout)
 
+        self.fc_out = nn.Linear(hid_dim, output_dim)
+
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, input, hidden, cell):
         # input = [batch size]
         # hidden = [n layers * n directions, batch size, hid dim]
         # cell = [n layers * n directions, batch size, hid dim]
@@ -88,69 +127,87 @@ class Decoder(nn.Module):
         # context = [n layers, batch size, hid dim]
 
         input = input.unsqueeze(0)
+
         # input = [1, batch size]
+
         embedded = self.dropout(self.embedding(input))
-        output,(hidden,cell) = self.rnn(embedded,(hidden,cell))
+
+        # embedded = [1, batch size, emb dim]
+
+        output, (hidden, cell) = self.rnn(embedded, (hidden, cell))
+
+        # output = [seq len, batch size, hid dim * n directions]
+        # hidden = [n layers * n directions, batch size, hid dim]
+        # cell = [n layers * n directions, batch size, hid dim]
+
+        # seq len and n directions will always be 1 in the decoder, therefore:
+        # output = [1, batch size, hid dim]
+        # hidden = [n layers, batch size, hid dim]
+        # cell = [n layers, batch size, hid dim]
 
         prediction = self.fc_out(output.squeeze(0))
+
         # prediction = [batch size, output dim]
 
-        return prediction,hidden,cell
+        return prediction, hidden, cell
 
 
 class Seq2Seq(nn.Module):
-    def __init__(self,encoder,decoder,device):
+    def __init__(self, encoder, decoder, device):
         super().__init__()
+
         self.encoder = encoder
         self.decoder = decoder
         self.device = device
 
+
         assert encoder.hid_dim == decoder.hid_dim, \
             "Hidden dimensions of encoder and decoder must be equal!"
         assert encoder.n_layers == decoder.n_layers, \
-            "Encoders and Decoders must have equal Number of layers!"
+            "Encoder and decoder must have equal number of layers!"
 
-    def forword(self,src,trg,teacher_forcing_ratio = 0.5):
-        #src = [src_len,batch_size]
-        #trg = [trg_len,batch_size]
+    def forward(self, src, trg, teacher_forcing_ratio=0.5):
+        # src = [src len, batch size]
+        # trg = [trg len, batch size]
+        # teacher_forcing_ratio is probability to use teacher forcing
+        # e.g. if teacher_forcing_ratio is 0.75 we use ground-truth inputs 75% of the time
 
         batch_size = trg.shape[1]
         trg_len = trg.shape[0]
-        #use english.vocab instead of self.decoder.output_dim
         trg_vocab_size = self.decoder.output_dim
 
-        #tensor to store decoder outputs
-        outputs = torch.zeros(trg_len,batch_size,trg_vocab_size).to(self.device)
+        # tensor to store decoder outputs
+        outputs = torch.zeros(trg_len, batch_size, trg_vocab_size).to(self.device)
 
         # last hidden state of the encoder is used as the initial hidden state of the decoder
-        hidden,cell = self.encoder(src)
+        hidden, cell = self.encoder(src)
 
-        #first input to the decoder is <sos> token
-        input = trg[0,:]
+        # first input to the decoder is the <sos> tokens
+        input = trg[0, :]
 
-        for t in range(1,trg_len):
-
+        for t in range(1, trg_len):
             # insert input token embedding, previous hidden and previous cell states
             # receive output tensor (predictions) and new hidden and cell states
-            output, hidden, cell = self.decoder(input,hidden,cell)
+            output, hidden, cell = self.decoder(input, hidden, cell)
 
-            #place prediction in a tensor holding predictions for each token
+            # place predictions in a tensor holding predictions for each token
             outputs[t] = output
 
-            #get the highest predicted token from our predictions
-            top1 = output.argmax(1)
-
+            # decide if we are going to use teacher forcing or not
             teacher_force = random.random() < teacher_forcing_ratio
 
+            # get the highest predicted token from our predictions
+            top1 = output.argmax(1)
+
+            # if teacher forcing, use actual next token as next input
+            # if not, use predicted token
             input = trg[t] if teacher_force else top1
 
         return outputs
 
-
 #TRAINING THE SEQ2SEQ MODEL
-
-INPUT_DIM = len(german.vocab)
-OUTPUT_DIM = len(english.vocab)
+INPUT_DIM = len(SRC.vocab)
+OUTPUT_DIM = len(TRG.vocab)
 ENC_EMB_DIM = 256
 DEC_EMB_DIM = 256
 HID_DIM = 512
@@ -158,63 +215,141 @@ N_LAYERS = 2
 ENC_DROPOUT = 0.5
 DEC_DROPOUT = 0.5
 
-enc = Encoder(INPUT_DIM,ENC_EMB_DIM,HID_DIM,N_LAYERS,ENC_DROPOUT)
-dec = Decoder(OUTPUT_DIM,DEC_EMB_DIM,HID_DIM,N_LAYERS,DEC_DROPOUT)
+enc = Encoder(INPUT_DIM, ENC_EMB_DIM, HID_DIM, N_LAYERS, ENC_DROPOUT)
+dec = Decoder(OUTPUT_DIM, DEC_EMB_DIM, HID_DIM, N_LAYERS, DEC_DROPOUT)
 
-model = Seq2Seq(enc,dec,device).to(device)
+model = Seq2Seq(enc, dec, device).to(device)
+sentence1 = "ein mann in einem blauen hemd steht auf einer leiter und putzt ein fenster"
+ts1 = []
 
 #INITIALIZING WEIGHTS IN PYTORCH from a uniform distribution between -0.08 and +0.08, i.e.(-0.08, 0.08).
 def init_weights(m):
     for name, param in m.named_parameters():
-        nn.init.uniform_(param.data,-0.08,0.08)
+        nn.init.uniform_(param.data, -0.08, 0.08)
+
+
 model.apply(init_weights)
 
 
 #TRAINABLE PARAMETERS IN THE MODEL
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
 print(f'The model has {count_parameters(model):,} trainable parameters')
+
 
 #We define our optimizer, which we use to update our parameters in the training loop
 optimizer = optim.Adam(model.parameters())
 
-
 #Next, we define our loss function. The CrossEntropyLoss function calculates both the log softmax as well as the negative log-likelihood of our predictions.
 #Our loss function calculates the average loss per token
-TRG_PAD_IDX = english.vocab.stoi[english.pad_token]
+TRG_PAD_IDX = TRG.vocab.stoi[TRG.pad_token]
+
 criterion = nn.CrossEntropyLoss(ignore_index = TRG_PAD_IDX)
 
 
-
-def train(model,iterator,optimizer,criterion,clip):
+def train(model, iterator, optimizer, criterion, clip):
     model.train()
+
     epoch_loss = 0
 
     for i, batch in enumerate(iterator):
         src = batch.src
         trg = batch.trg
+
         optimizer.zero_grad()
 
-        output = model(src,trg)
+        output = model(src, trg)
 
         # trg = [trg len, batch size]
         # output = [trg len, batch size, output dim]
 
         output_dim = output.shape[-1]
-        output =output[1:].view(-1, output_dim)
-        trg = trg[1:].view[-1]
+
+        output = output[1:].view(-1, output_dim)
+        trg = trg[1:].view(-1)
+
         # trg = [(trg len - 1) * batch size]
         # output = [(trg len - 1) * batch size, output dim]
 
-        loss = criterion(output,trg)
+        loss = criterion(output, trg)
 
         loss.backward()
 
-        torch.nn.utils.clip_grad_norm(model.parameters(),clip)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
 
         optimizer.step()
 
-        epoch_loss +=loss.item()
+        epoch_loss += loss.item()
 
-    return epoch_loss/len(iterator)
+    return epoch_loss / len(iterator)
 
+
+def evaluate(model, iterator, criterion):
+    model.eval()
+
+    epoch_loss = 0
+
+    with torch.no_grad():
+        for i, batch in enumerate(iterator):
+            src = batch.src
+            trg = batch.trg
+
+            output = model(src, trg, 0)  # turn off teacher forcing
+
+            # trg = [trg len, batch size]
+            # output = [trg len, batch size, output dim]
+
+            output_dim = output.shape[-1]
+
+            output = output[1:].view(-1, output_dim)
+            trg = trg[1:].view(-1)
+
+            # trg = [(trg len - 1) * batch size]
+            # output = [(trg len - 1) * batch size, output dim]
+
+            loss = criterion(output, trg)
+
+            epoch_loss += loss.item()
+
+    return epoch_loss / len(iterator)
+
+def epoch_time(start_time, end_time):
+    elapsed_time = end_time - start_time
+    elapsed_mins = int(elapsed_time / 60)
+    elapsed_secs = int(elapsed_time - (elapsed_mins * 60))
+    return elapsed_mins, elapsed_secs
+
+
+N_EPOCHS = 10
+CLIP = 1
+
+best_valid_loss = float('inf')
+
+for epoch in range(N_EPOCHS):
+
+
+    start_time = time.time()
+
+    train_loss = train(model, train_iterator, optimizer, criterion, CLIP)
+    valid_loss = evaluate(model, valid_iterator, criterion)
+
+    end_time = time.time()
+
+    epoch_mins, epoch_secs = epoch_time(start_time, end_time)
+
+    if valid_loss < best_valid_loss:
+        best_valid_loss = valid_loss
+        torch.save(model.state_dict(), 'tut1-model.pt')
+
+    print(f'Epoch: {epoch + 1:02} | Time: {epoch_mins}m {epoch_secs}s')
+    print(f'\tTrain Loss: {train_loss:.3f} | Train PPL: {math.exp(train_loss):7.3f}')
+    print(f'\t Val. Loss: {valid_loss:.3f} |  Val. PPL: {math.exp(valid_loss):7.3f}')
+    print('Using device:', device)
+
+
+model.load_state_dict(torch.load('tut1-model.pt'))
+
+test_loss = evaluate(model, test_iterator, criterion)
+
+print(f'| Test Loss: {test_loss:.3f} | Test PPL: {math.exp(test_loss):7.3f} |')
