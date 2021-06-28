@@ -174,3 +174,47 @@ model.apply(init_weights)
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 print(f'The model has {count_parameters(model):,} trainable parameters')
+
+#We define our optimizer, which we use to update our parameters in the training loop
+optimizer = optim.Adam(model.parameters())
+
+
+#Next, we define our loss function. The CrossEntropyLoss function calculates both the log softmax as well as the negative log-likelihood of our predictions.
+#Our loss function calculates the average loss per token
+TRG_PAD_IDX = english.vocab.stoi[english.pad_token]
+criterion = nn.CrossEntropyLoss(ignore_index = TRG_PAD_IDX)
+
+
+
+def train(model,iterator,optimizer,criterion,clip):
+    model.train()
+    epoch_loss = 0
+
+    for i, batch in enumerate(iterator):
+        src = batch.src
+        trg = batch.trg
+        optimizer.zero_grad()
+
+        output = model(src,trg)
+
+        # trg = [trg len, batch size]
+        # output = [trg len, batch size, output dim]
+
+        output_dim = output.shape[-1]
+        output =output[1:].view(-1, output_dim)
+        trg = trg[1:].view[-1]
+        # trg = [(trg len - 1) * batch size]
+        # output = [(trg len - 1) * batch size, output dim]
+
+        loss = criterion(output,trg)
+
+        loss.backward()
+
+        torch.nn.utils.clip_grad_norm(model.parameters(),clip)
+
+        optimizer.step()
+
+        epoch_loss +=loss.item()
+
+    return epoch_loss/len(iterator)
+
