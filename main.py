@@ -1,4 +1,5 @@
 """https://towardsdatascience.com/a-comprehensive-guide-to-neural-machine-translation-using-seq2sequence-modelling-using-pytorch-41c9b84ba350"""
+""" https://github.com/bentrevett/pytorch-seq2seq/blob/master/1%20-%20Sequence%20to%20Sequence%20Learning%20with%20Neural%20Networks.ipynb """
 
 import torch
 import torch.nn as nn
@@ -161,3 +162,9 @@ enc = Encoder(INPUT_DIM,ENC_EMB_DIM,HID_DIM,N_LAYERS,ENC_DROPOUT)
 dec = Decoder(OUTPUT_DIM,DEC_EMB_DIM,HID_DIM,N_LAYERS,DEC_DROPOUT)
 
 model = Seq2Seq(enc,dec,device).to(device)
+
+#INITIALIZING WEIGHTS IN PYTORCH from a uniform distribution between -0.08 and +0.08, i.e.(-0.08, 0.08).
+def init_weights(m):
+    for name, param in m.named_parameters():
+        nn.init.uniform_(param.data,-0.08,0.08)
+model.apply(init_weights) 
