@@ -109,6 +109,39 @@ class Encoder(nn.Module):
 
         return outputs,hidden
 
+class Attention(nn.Module):
+    def __init__(self,enc_hid_dim, dec_hid_dim):
+        super().__init__()
+        #attention layer will take in the previous hidden state of the decoder, $s_{t-1}$, and all of the stacked forward and backward hidden states from the encoder,H.
+        self.attn = nn.Linear((enc_hid_dim*2)+dec_hid_dim, dec_hid_dim)
+        #We currently have a [dec hid dim, src len] tensor for each example in the batch. We want this to be [src len] for each example in the batch as the attention should be over the length of the source sentence. This is achieved by multiplying the energy by a [1, dec hid dim] tensor, v.
+        self.v = nn.Linear(dec_hid_dim,1)
+
+
+    def forward(self,hidden,encoder_outputs):
+        # hidden = [batch size, dec hid dim]
+        # encoder_outputs = [src len, batch size, enc hid dim * 2]
+        batch_size = encoder_outputs.shape[1]
+        src_len = encoder_outputs.shape[0]
+
+        #repeat decoder hidden state src_len times
+        #one more axis is added at 1 and it is repeated src_len times
+        hidden = hidden.unsqueeze(1).repeat(1,src_len,1)
+
+        encoder_outputs = encoder_outputs.permute(1,0,2)
+        #hidden = [batch size, src len, dec hid dim]
+        #encoder_outputs = [batch_size, src_len, enc_hid_dim*2]
+        #hidden is the output from last decoder state
+
+        energy = torch.tanh(self.attn(torch.cat((hidden,encoder_outputs),dim = 2)))
+        #energy = [batch_size, src_len, dec_hid_dim]
+
+        #attention = v*Energy
+        # v = [dec_hid_dim, 1]
+        attention = self.v(energy).squeeze(2)
+        #attention = [batch_size, src_len]
+
+        return F.softmax(attention, dim=1)
 
 class Decoder(nn.Module):
     def __init__(self, output_dim, emb_dim, hid_dim, n_layers, dropout):
