@@ -10,6 +10,9 @@ import torch.nn.functional as F
 from torchtext.legacy.datasets import Multi30k
 from torchtext.legacy.data import Field, BucketIterator
 
+import matplotlib.pyplot as plt
+import matplotlib.ticker as ticker
+
 import spacy
 import numpy as np
 
@@ -17,27 +20,27 @@ import random
 import math
 import time
 
-##Data Preparation and Pre-processing
-
 spacy_de = spacy.load('de_core_news_sm')
 spacy_en = spacy.load('en_core_web_sm')
 
 def tokenize_de(text):
     """
-    Tokenizes German text from a string into a list of strings (tokens) and reverses it
+    Tokenizes German text from a string into a list of strings
     """
     return [tok.text for tok in spacy_de.tokenizer(text)]
 
 def tokenize_en(text):
     """
-    Tokenizes English text from a string into a list of strings (tokens)
+    Tokenizes English text from a string into a list of strings
     """
     return [tok.text for tok in spacy_en.tokenizer(text)]
+
 
 SRC = Field(tokenize = tokenize_de,
             init_token = '<sos>',
             eos_token = '<eos>',
-            lower = True)
+            lower = True,
+            include_lengths = True)
 
 TRG = Field(tokenize = tokenize_en,
             init_token = '<sos>',
@@ -47,126 +50,128 @@ TRG = Field(tokenize = tokenize_en,
 train_data, valid_data, test_data = Multi30k.splits(exts = ('.de', '.en'),
                                                     fields = (SRC, TRG))
 
-print(f"Number of training examples: {len(train_data.examples)}")
-print(f"Number of validation examples: {len(valid_data.examples)}")
-print(f"Number of testing examples: {len(test_data.examples)}")
-
-print(vars(train_data.examples[0]))
-
 SRC.build_vocab(train_data, min_freq = 2)
 TRG.build_vocab(train_data, min_freq = 2)
 
-print(f"Unique tokens in source (de) vocabulary: {len(SRC.vocab)}")
-print(f"Unique tokens in target (en) vocabulary: {len(TRG.vocab)}")
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+BATCH_SIZE = 64
 
-BATCH_SIZE = 128
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 train_iterator, valid_iterator, test_iterator = BucketIterator.splits(
     (train_data, valid_data, test_data),
-    batch_size = BATCH_SIZE,
-    device = device)
+     batch_size = BATCH_SIZE,
+     sort_within_batch = True,
+     sort_key = lambda x : len(x.src),
+     device = device)
 
-#Building an Encoder
+
 class Encoder(nn.Module):
     def __init__(self, input_dim, emb_dim, enc_hid_dim, dec_hid_dim, dropout):
         super().__init__()
-        # YAHA SIRF INITIALISATION KIYA HAIN
 
-        # "embedding" is an object created for the Layer "Embedding"
-        # so to perform embedding process we use its object
         self.embedding = nn.Embedding(input_dim, emb_dim)
 
-        self.rnn = nn.GRU(emb_dim, enc_hid_dim,bidirectional=True)
+        self.rnn = nn.GRU(emb_dim, enc_hid_dim, bidirectional=True)
 
-        self.fc = nn.Linear(enc_hid_dim * 2,dec_hid_dim)
+        self.fc = nn.Linear(enc_hid_dim * 2, dec_hid_dim)
 
         self.dropout = nn.Dropout(dropout)
 
-    # YAHA PE ACTUALLY LSTM AUR EMBEDDING LAYER AUR DROPOUT LAYERS NE KAAM KIYA HAIN
-    def forward(self, src):
+    def forward(self, src, src_len):
         # src = [src len, batch size]
-        # PASSSED THE GERMAN LANGUAGE INTO EMBEDDING LAYER AND ADD DROPOUTS
+        # src_len = [batch size]
+
         embedded = self.dropout(self.embedding(src))
 
         # embedded = [src len, batch size, emb dim]
-        # OUTPUT OF THIS EMBEDDING LAYER IS PASSED ON TO THE GRU LAYER
-        outputs, hidden = self.rnn(embedded)
 
-        # outputs = [src len, batch size, hid dim * n directions]
-        # hidden = [n layers * n directions, batch size, hid dim]
+        # need to explicitly put lengths on cpu!
+        packed_embedded = nn.utils.rnn.pack_padded_sequence(embedded, src_len.to('cpu'))
+
+        packed_outputs, hidden = self.rnn(packed_embedded)
+
+        # packed_outputs is a packed sequence containing all hidden states
+        # hidden is now from the final non-padded element in the batch
+
+        outputs, _ = nn.utils.rnn.pad_packed_sequence(packed_outputs)
+
+        # outputs is now a non-packed sequence, all hidden states obtained
+        #  when the input is a pad token are all zeros
+
+        # outputs = [src len, batch size, hid dim * num directions]
+        # hidden = [n layers * num directions, batch size, hid dim]
 
         # hidden is stacked [forward_1, backward_1, forward_2, backward_2, ...]
         # outputs are always from the last layer
+
         # hidden [-2, :, : ] is the last of the forwards RNN
         # hidden [-1, :, : ] is the last of the backwards RNN
 
         # initial decoder hidden is final hidden state of the forwards and backwards
         #  encoder RNNs fed through a linear layer
-        hidden = torch.tanh(self.fc(torch.cat((hidden[-2,:,:], hidden[-1,:,:]),dim=1)))
+        hidden = torch.tanh(self.fc(torch.cat((hidden[-2, :, :], hidden[-1, :, :]), dim=1)))
+
         # outputs = [src len, batch size, enc hid dim * 2]
         # hidden = [batch size, dec hid dim]
 
-        return outputs,hidden
+        return outputs, hidden
+
 
 class Attention(nn.Module):
-    def __init__(self,enc_hid_dim, dec_hid_dim):
+    def __init__(self, enc_hid_dim, dec_hid_dim):
         super().__init__()
-        #attention layer will take in the previous hidden state of the decoder, $s_{t-1}$, and all of the stacked forward and backward hidden states from the encoder,H.
-        self.attn = nn.Linear((enc_hid_dim*2)+dec_hid_dim, dec_hid_dim)
-        #We currently have a [dec hid dim, src len] tensor for each example in the batch. We want this to be [src len] for each example in the batch as the attention should be over the length of the source sentence. This is achieved by multiplying the energy by a [1, dec hid dim] tensor, v.
-        self.v = nn.Linear(dec_hid_dim,1)
 
+        self.attn = nn.Linear((enc_hid_dim * 2) + dec_hid_dim, dec_hid_dim)
+        self.v = nn.Linear(dec_hid_dim, 1, bias=False)
 
-    def forward(self,hidden,encoder_outputs):
+    def forward(self, hidden, encoder_outputs, mask):
         # hidden = [batch size, dec hid dim]
         # encoder_outputs = [src len, batch size, enc hid dim * 2]
+
         batch_size = encoder_outputs.shape[1]
         src_len = encoder_outputs.shape[0]
 
-        #repeat decoder hidden state src_len times
-        #one more axis is added at 1 and it is repeated src_len times
-        hidden = hidden.unsqueeze(1).repeat(1,src_len,1)
+        # repeat decoder hidden state src_len times
+        hidden = hidden.unsqueeze(1).repeat(1, src_len, 1)
 
-        encoder_outputs = encoder_outputs.permute(1,0,2)
-        #hidden = [batch size, src len, dec hid dim]
-        #encoder_outputs = [batch_size, src_len, enc_hid_dim*2]
-        #hidden is the output from last decoder state
+        encoder_outputs = encoder_outputs.permute(1, 0, 2)
 
-        energy = torch.tanh(self.attn(torch.cat((hidden,encoder_outputs),dim = 2)))
-        #energy = [batch_size, src_len, dec_hid_dim]
+        # hidden = [batch size, src len, dec hid dim]
+        # encoder_outputs = [batch size, src len, enc hid dim * 2]
 
-        #attention = v*Energy
-        # v = [dec_hid_dim, 1]
+        energy = torch.tanh(self.attn(torch.cat((hidden, encoder_outputs), dim=2)))
+
+        # energy = [batch size, src len, dec hid dim]
+
         attention = self.v(energy).squeeze(2)
-        #attention = [batch_size, src_len]
+
+        # attention = [batch size, src len]
+
+        attention = attention.masked_fill(mask == 0, -1e10)
 
         return F.softmax(attention, dim=1)
 
+
 class Decoder(nn.Module):
-    def __init__(self, output_dim, emb_dim, hid_dim, n_layers, dropout):
+    def __init__(self, output_dim, emb_dim, enc_hid_dim, dec_hid_dim, dropout, attention):
         super().__init__()
 
         self.output_dim = output_dim
-        self.hid_dim = hid_dim
-        self.n_layers = n_layers
+        self.attention = attention
 
         self.embedding = nn.Embedding(output_dim, emb_dim)
 
-        self.rnn = nn.LSTM(emb_dim, hid_dim, n_layers, dropout=dropout)
+        self.rnn = nn.GRU((enc_hid_dim * 2) + emb_dim, dec_hid_dim)
 
-        self.fc_out = nn.Linear(hid_dim, output_dim)
+        self.fc_out = nn.Linear((enc_hid_dim * 2) + dec_hid_dim + emb_dim, output_dim)
 
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, input, hidden, cell):
+    def forward(self, input, hidden, encoder_outputs, mask):
         # input = [batch size]
-        # hidden = [n layers * n directions, batch size, hid dim]
-        # cell = [n layers * n directions, batch size, hid dim]
-
-        # n directions in the decoder will both always be 1, therefore:
-        # hidden = [n layers, batch size, hid dim]
-        # context = [n layers, batch size, hid dim]
+        # hidden = [batch size, dec hid dim]
+        # encoder_outputs = [src len, batch size, enc hid dim * 2]
+        # mask = [batch size, src len]
 
         input = input.unsqueeze(0)
 
@@ -176,61 +181,95 @@ class Decoder(nn.Module):
 
         # embedded = [1, batch size, emb dim]
 
-        output, (hidden, cell) = self.rnn(embedded, (hidden, cell))
+        a = self.attention(hidden, encoder_outputs, mask)
 
-        # output = [seq len, batch size, hid dim * n directions]
-        # hidden = [n layers * n directions, batch size, hid dim]
-        # cell = [n layers * n directions, batch size, hid dim]
+        # a = [batch size, src len]
 
-        # seq len and n directions will always be 1 in the decoder, therefore:
-        # output = [1, batch size, hid dim]
-        # hidden = [n layers, batch size, hid dim]
-        # cell = [n layers, batch size, hid dim]
+        a = a.unsqueeze(1)
 
-        prediction = self.fc_out(output.squeeze(0))
+        # a = [batch size, 1, src len]
+
+        encoder_outputs = encoder_outputs.permute(1, 0, 2)
+
+        # encoder_outputs = [batch size, src len, enc hid dim * 2]
+
+        weighted = torch.bmm(a, encoder_outputs)
+
+        # weighted = [batch size, 1, enc hid dim * 2]
+
+        weighted = weighted.permute(1, 0, 2)
+
+        # weighted = [1, batch size, enc hid dim * 2]
+
+        rnn_input = torch.cat((embedded, weighted), dim=2)
+
+        # rnn_input = [1, batch size, (enc hid dim * 2) + emb dim]
+
+        output, hidden = self.rnn(rnn_input, hidden.unsqueeze(0))
+
+        # output = [seq len, batch size, dec hid dim * n directions]
+        # hidden = [n layers * n directions, batch size, dec hid dim]
+
+        # seq len, n layers and n directions will always be 1 in this decoder, therefore:
+        # output = [1, batch size, dec hid dim]
+        # hidden = [1, batch size, dec hid dim]
+        # this also means that output == hidden
+        assert (output == hidden).all()
+
+        embedded = embedded.squeeze(0)
+        output = output.squeeze(0)
+        weighted = weighted.squeeze(0)
+
+        prediction = self.fc_out(torch.cat((output, weighted, embedded), dim=1))
 
         # prediction = [batch size, output dim]
 
-        return prediction, hidden, cell
+        return prediction, hidden.squeeze(0), a.squeeze(1)
 
 
 class Seq2Seq(nn.Module):
-    def __init__(self, encoder, decoder, device):
+    def __init__(self, encoder, decoder, src_pad_idx, device):
         super().__init__()
 
         self.encoder = encoder
         self.decoder = decoder
+        self.src_pad_idx = src_pad_idx
         self.device = device
 
+    def create_mask(self, src):
+        mask = (src != self.src_pad_idx).permute(1, 0)
+        return mask
 
-        assert encoder.hid_dim == decoder.hid_dim, \
-            "Hidden dimensions of encoder and decoder must be equal!"
-        assert encoder.n_layers == decoder.n_layers, \
-            "Encoder and decoder must have equal number of layers!"
-
-    def forward(self, src, trg, teacher_forcing_ratio=0.5):
+    def forward(self, src, src_len, trg, teacher_forcing_ratio=0.5):
         # src = [src len, batch size]
+        # src_len = [batch size]
         # trg = [trg len, batch size]
         # teacher_forcing_ratio is probability to use teacher forcing
-        # e.g. if teacher_forcing_ratio is 0.75 we use ground-truth inputs 75% of the time
+        # e.g. if teacher_forcing_ratio is 0.75 we use teacher forcing 75% of the time
 
-        batch_size = trg.shape[1]
+        batch_size = src.shape[1]
         trg_len = trg.shape[0]
         trg_vocab_size = self.decoder.output_dim
 
         # tensor to store decoder outputs
         outputs = torch.zeros(trg_len, batch_size, trg_vocab_size).to(self.device)
 
-        # last hidden state of the encoder is used as the initial hidden state of the decoder
-        hidden, cell = self.encoder(src)
+        # encoder_outputs is all hidden states of the input sequence, back and forwards
+        # hidden is the final forward and backward hidden states, passed through a linear layer
+        encoder_outputs, hidden = self.encoder(src, src_len)
 
         # first input to the decoder is the <sos> tokens
         input = trg[0, :]
 
+        mask = self.create_mask(src)
+
+        # mask = [batch size, src len]
+
         for t in range(1, trg_len):
-            # insert input token embedding, previous hidden and previous cell states
-            # receive output tensor (predictions) and new hidden and cell states
-            output, hidden, cell = self.decoder(input, hidden, cell)
+            # insert input token embedding, previous hidden state, all encoder hidden states
+            #  and mask
+            # receive output tensor (predictions) and new hidden state
+            output, hidden, _ = self.decoder(input, hidden, encoder_outputs, mask)
 
             # place predictions in a tensor holding predictions for each token
             outputs[t] = output
@@ -247,44 +286,40 @@ class Seq2Seq(nn.Module):
 
         return outputs
 
-#TRAINING THE SEQ2SEQ MODEL
 INPUT_DIM = len(SRC.vocab)
 OUTPUT_DIM = len(TRG.vocab)
 ENC_EMB_DIM = 256
 DEC_EMB_DIM = 256
-HID_DIM = 512
-N_LAYERS = 2
+ENC_HID_DIM = 512
+DEC_HID_DIM = 512
 ENC_DROPOUT = 0.5
 DEC_DROPOUT = 0.5
+SRC_PAD_IDX = SRC.vocab.stoi[SRC.pad_token]
 
-enc = Encoder(INPUT_DIM, ENC_EMB_DIM, HID_DIM, N_LAYERS, ENC_DROPOUT)
-dec = Decoder(OUTPUT_DIM, DEC_EMB_DIM, HID_DIM, N_LAYERS, DEC_DROPOUT)
+attn = Attention(ENC_HID_DIM, DEC_HID_DIM)
+enc = Encoder(INPUT_DIM, ENC_EMB_DIM, ENC_HID_DIM, DEC_HID_DIM, ENC_DROPOUT)
+dec = Decoder(OUTPUT_DIM, DEC_EMB_DIM, ENC_HID_DIM, DEC_HID_DIM, DEC_DROPOUT, attn)
 
-model = Seq2Seq(enc, dec, device).to(device)
-sentence1 = "ein mann in einem blauen hemd steht auf einer leiter und putzt ein fenster"
-ts1 = []
+model = Seq2Seq(enc, dec, SRC_PAD_IDX, device).to(device)
 
-#INITIALIZING WEIGHTS IN PYTORCH from a uniform distribution between -0.08 and +0.08, i.e.(-0.08, 0.08).
+
 def init_weights(m):
     for name, param in m.named_parameters():
-        nn.init.uniform_(param.data, -0.08, 0.08)
+        if 'weight' in name:
+            nn.init.normal_(param.data, mean=0, std=0.01)
+        else:
+            nn.init.constant_(param.data, 0)
 
 
 model.apply(init_weights)
 
-
-#TRAINABLE PARAMETERS IN THE MODEL
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 print(f'The model has {count_parameters(model):,} trainable parameters')
 
-
-#We define our optimizer, which we use to update our parameters in the training loop
 optimizer = optim.Adam(model.parameters())
 
-#Next, we define our loss function. The CrossEntropyLoss function calculates both the log softmax as well as the negative log-likelihood of our predictions.
-#Our loss function calculates the average loss per token
 TRG_PAD_IDX = TRG.vocab.stoi[TRG.pad_token]
 
 criterion = nn.CrossEntropyLoss(ignore_index = TRG_PAD_IDX)
@@ -296,12 +331,12 @@ def train(model, iterator, optimizer, criterion, clip):
     epoch_loss = 0
 
     for i, batch in enumerate(iterator):
-        src = batch.src
+        src, src_len = batch.src
         trg = batch.trg
 
         optimizer.zero_grad()
 
-        output = model(src, trg)
+        output = model(src, src_len, trg)
 
         # trg = [trg len, batch size]
         # output = [trg len, batch size, output dim]
@@ -334,10 +369,10 @@ def evaluate(model, iterator, criterion):
 
     with torch.no_grad():
         for i, batch in enumerate(iterator):
-            src = batch.src
+            src, src_len = batch.src
             trg = batch.trg
 
-            output = model(src, trg, 0)  # turn off teacher forcing
+            output = model(src, src_len, trg, 0)  # turn off teacher forcing
 
             # trg = [trg len, batch size]
             # output = [trg len, batch size, output dim]
@@ -370,7 +405,6 @@ best_valid_loss = float('inf')
 
 for epoch in range(N_EPOCHS):
 
-
     start_time = time.time()
 
     train_loss = train(model, train_iterator, optimizer, criterion, CLIP)
@@ -382,16 +416,151 @@ for epoch in range(N_EPOCHS):
 
     if valid_loss < best_valid_loss:
         best_valid_loss = valid_loss
-        torch.save(model.state_dict(), 'tut1-model.pt')
+        torch.save(model.state_dict(), 'tut4-model.pt')
 
     print(f'Epoch: {epoch + 1:02} | Time: {epoch_mins}m {epoch_secs}s')
     print(f'\tTrain Loss: {train_loss:.3f} | Train PPL: {math.exp(train_loss):7.3f}')
     print(f'\t Val. Loss: {valid_loss:.3f} |  Val. PPL: {math.exp(valid_loss):7.3f}')
-    print('Using device:', device)
 
-
-model.load_state_dict(torch.load('tut1-model.pt'))
+model.load_state_dict(torch.load('tut4-model.pt'))
 
 test_loss = evaluate(model, test_iterator, criterion)
 
 print(f'| Test Loss: {test_loss:.3f} | Test PPL: {math.exp(test_loss):7.3f} |')
+
+
+def translate_sentence(sentence, src_field, trg_field, model, device, max_len=50):
+    model.eval()
+
+    if isinstance(sentence, str):
+        nlp = spacy.load('de')
+        tokens = [token.text.lower() for token in nlp(sentence)]
+    else:
+        tokens = [token.lower() for token in sentence]
+
+    tokens = [src_field.init_token] + tokens + [src_field.eos_token]
+
+    src_indexes = [src_field.vocab.stoi[token] for token in tokens]
+
+    src_tensor = torch.LongTensor(src_indexes).unsqueeze(1).to(device)
+
+    src_len = torch.LongTensor([len(src_indexes)])
+
+    with torch.no_grad():
+        encoder_outputs, hidden = model.encoder(src_tensor, src_len)
+
+    mask = model.create_mask(src_tensor)
+
+    trg_indexes = [trg_field.vocab.stoi[trg_field.init_token]]
+
+    attentions = torch.zeros(max_len, 1, len(src_indexes)).to(device)
+
+    for i in range(max_len):
+
+        trg_tensor = torch.LongTensor([trg_indexes[-1]]).to(device)
+
+        with torch.no_grad():
+            output, hidden, attention = model.decoder(trg_tensor, hidden, encoder_outputs, mask)
+
+        attentions[i] = attention
+
+        pred_token = output.argmax(1).item()
+
+        trg_indexes.append(pred_token)
+
+        if pred_token == trg_field.vocab.stoi[trg_field.eos_token]:
+            break
+
+    trg_tokens = [trg_field.vocab.itos[i] for i in trg_indexes]
+
+    return trg_tokens[1:], attentions[:len(trg_tokens) - 1]
+
+
+def display_attention(sentence, translation, attention):
+    fig = plt.figure(figsize=(10, 10))
+    ax = fig.add_subplot(111)
+
+    attention = attention.squeeze(1).cpu().detach().numpy()
+
+    cax = ax.matshow(attention, cmap='bone')
+
+    ax.tick_params(labelsize=15)
+
+    x_ticks = [''] + ['<sos>'] + [t.lower() for t in sentence] + ['<eos>']
+    y_ticks = [''] + translation
+
+    ax.set_xticklabels(x_ticks, rotation=45)
+    ax.set_yticklabels(y_ticks)
+
+    ax.xaxis.set_major_locator(ticker.MultipleLocator(1))
+    ax.yaxis.set_major_locator(ticker.MultipleLocator(1))
+
+    plt.show()
+    plt.close()
+
+example_idx = 12
+
+src = vars(train_data.examples[example_idx])['src']
+trg = vars(train_data.examples[example_idx])['trg']
+
+print(f'src = {src}')
+print(f'trg = {trg}')
+
+translation, attention = translate_sentence(src, SRC, TRG, model, device)
+
+print(f'predicted trg = {translation}')
+
+display_attention(src, translation, attention)
+
+example_idx = 14
+
+src = vars(valid_data.examples[example_idx])['src']
+trg = vars(valid_data.examples[example_idx])['trg']
+
+print(f'src = {src}')
+print(f'trg = {trg}')
+
+translation, attention = translate_sentence(src, SRC, TRG, model, device)
+
+print(f'predicted trg = {translation}')
+
+display_attention(src, translation, attention)
+
+example_idx = 18
+
+src = vars(test_data.examples[example_idx])['src']
+trg = vars(test_data.examples[example_idx])['trg']
+
+print(f'src = {src}')
+print(f'trg = {trg}')
+
+translation, attention = translate_sentence(src, SRC, TRG, model, device)
+
+print(f'predicted trg = {translation}')
+
+display_attention(src, translation, attention)
+
+from torchtext.data.metrics import bleu_score
+
+
+def calculate_bleu(data, src_field, trg_field, model, device, max_len=50):
+    trgs = []
+    pred_trgs = []
+
+    for datum in data:
+        src = vars(datum)['src']
+        trg = vars(datum)['trg']
+
+        pred_trg, _ = translate_sentence(src, src_field, trg_field, model, device, max_len)
+
+        # cut off <eos> token
+        pred_trg = pred_trg[:-1]
+
+        pred_trgs.append(pred_trg)
+        trgs.append([trg])
+
+    return bleu_score(pred_trgs, trgs)
+
+bleu_score = calculate_bleu(test_data, SRC, TRG, model, device)
+
+print(f'BLEU score = {bleu_score*100:.2f}')
